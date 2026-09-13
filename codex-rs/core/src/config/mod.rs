@@ -988,6 +988,9 @@ pub struct Config {
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: AbsolutePathBuf,
 
+    /// Native account credential directory, independent of runtime state.
+    pub auth_home: AbsolutePathBuf,
+
     /// Resolved configuration shared by all Codex SQLite databases.
     pub sqlite: codex_state::SqliteConfig,
 
@@ -1440,7 +1443,7 @@ pub struct TerminalResizeReflowConfig {
 
 impl AuthManagerConfig for Config {
     fn codex_home(&self) -> PathBuf {
-        self.codex_home.to_path_buf()
+        self.auth_home.to_path_buf()
     }
 
     fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode {
@@ -4516,6 +4519,7 @@ impl Config {
                 .transpose()?,
             memories: memories_config,
             agent_interrupt_message_enabled,
+            auth_home: cfg.auth_home.clone().unwrap_or_else(|| codex_home.clone()),
             codex_home,
             sqlite: codex_state::SqliteConfig::from_sqlite_home(sqlite_home),
             log_dir,
