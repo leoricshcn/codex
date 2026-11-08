@@ -566,6 +566,17 @@ impl RealtimeWebsocketEvents {
             match msg {
                 Message::Text(text) => {
                     trace!(target: REALTIME_WIRE_LOG_TARGET, "realtime websocket event: {text}");
+                    // Frameless Bidi closes the application session before the
+                    // transport, whose eventual Close frame may omit a status.
+                    // Preserve the explicit terminal boundary rather than
+                    // waiting for a socket error after successful transcription.
+                    if self.event_parser == RealtimeEventParser::FramelessBidi
+                        && serde_json::from_str::<serde_json::Value>(&text)
+                            .is_ok_and(|value| value.get("type").and_then(|v| v.as_str()) == Some("session.closed"))
+                    {
+                        self.is_closed.store(true, Ordering::SeqCst);
+                        return Ok(None);
+                    }
                     if let Some(mut event) = parse_realtime_event(&text, self.event_parser) {
                         self.update_active_transcript(&mut event).await;
                         debug!(?event, "realtime websocket parsed event");
@@ -1472,6 +1483,28 @@ mod tests {
             }]
         );
         assert_eq!(events.take_transcript_tail().await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn frameless_session_closed_finishes_after_confirmed_transcript_without_transport_close() {
+        let (tx_message, rx_message) = async_channel::unbounded();
+        let events = RealtimeWebsocketEvents {
+            rx_message,
+            pending_events: Arc::new(Mutex::new(VecDeque::new())),
+            transcript_state: RealtimeTranscriptState::default(),
+            event_parser: RealtimeEventParser::FramelessBidi,
+            is_closed: Arc::new(AtomicBool::new(false)),
+        };
+        tx_message.send(Ok(Message::Text(serde_json::json!({
+            "type":"turn.done", "turn":{"role":"user","transcript":"synthetic words"}
+        }).to_string().into()))).await.unwrap();
+        tx_message.send(Ok(Message::Text(serde_json::json!({
+            "type":"session.closed", "reason":"client_requested"
+        }).to_string().into()))).await.unwrap();
+        assert!(matches!(events.next_event().await.unwrap(), Some(RealtimeEvent::InputTranscriptDone(_))));
+        assert!(tokio::time::timeout(Duration::from_millis(100), events.next_event()).await.unwrap().unwrap().is_none());
+        assert!(tokio::time::timeout(Duration::from_millis(100), events.next_event()).await.unwrap().unwrap().is_none());
+        assert!(events.is_closed.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
