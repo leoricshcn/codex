@@ -376,6 +376,10 @@ pub struct ConfigToml {
     /// Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`.
     pub sqlite_home: Option<AbsolutePathBuf>,
 
+    /// Directory for native account credentials. Defaults to the Codex home.
+    /// Login, refresh and logout operate on this directory; runtime state does not.
+    pub auth_home: Option<AbsolutePathBuf>,
+
     /// Directory for log files. Setting this value explicitly also routes the
     /// SQLite logs database here and enables the TUI text log in this directory.
     /// When unset, log files use `$CODEX_HOME/log` and SQLite logs use `sqlite_home`.

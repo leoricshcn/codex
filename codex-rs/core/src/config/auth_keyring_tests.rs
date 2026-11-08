@@ -180,3 +180,18 @@ fn config_toml_load_result(
         )?,
     })
 }
+#[tokio::test]
+async fn explicit_auth_home_preserves_runtime_directory() {
+    let runtime = tempfile::tempdir().unwrap();
+    let auth = tempfile::tempdir().unwrap();
+    let config = super::super::ConfigBuilder::default()
+        .codex_home(runtime.path().to_path_buf())
+        .cli_overrides(vec![("auth_home".into(), toml::Value::String(auth.path().display().to_string()))])
+        .build().await.unwrap();
+    assert_eq!(config.auth_home.as_path(), auth.path());
+    assert_eq!(config.auth_config().codex_home, auth.path());
+    assert_eq!(codex_login::AuthManagerConfig::codex_home(&config), auth.path());
+    assert_eq!(config.codex_home.as_path(), runtime.path());
+    assert!(config.sqlite.home().starts_with(runtime.path()));
+    assert!(config.log_dir.starts_with(runtime.path()));
+}
