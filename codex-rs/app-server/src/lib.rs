@@ -209,6 +209,81 @@ enum OutboundControlEvent {
     DisconnectAll,
 }
 
+async fn dispatch_network_message(
+    processor: &Arc<MessageProcessor>,
+    transport: &AppServerTransport,
+    connection_id: ConnectionId,
+    connection_state: &ConnectionState,
+    message: JSONRPCMessage,
+    remote_status: Option<(
+        &OutgoingMessageSender,
+        &codex_app_server_protocol::RemoteControlStatusChangedNotification,
+    )>,
+) {
+    if connection_state.session.rpc_gate.is_closed() {
+        return;
+    }
+    match message {
+        JSONRPCMessage::Request(request) => {
+            let was_initialized = connection_state.session.initialized();
+            processor
+                .process_request(
+                    connection_id,
+                    request,
+                    transport,
+                    Arc::clone(&connection_state.session),
+                )
+                .await;
+            let opted_out_notification_methods_snapshot =
+                connection_state.session.opted_out_notification_methods();
+            let experimental_api_enabled = connection_state.session.experimental_api_enabled();
+            let is_initialized = connection_state.session.initialized();
+            if let Ok(mut opted_out_notification_methods) = connection_state
+                .outbound_opted_out_notification_methods
+                .write()
+            {
+                *opted_out_notification_methods = opted_out_notification_methods_snapshot;
+            } else {
+                warn!("failed to update outbound opted-out notifications");
+            }
+            connection_state.outbound_experimental_api_enabled.store(
+                experimental_api_enabled,
+                std::sync::atomic::Ordering::Release,
+            );
+            if !was_initialized && is_initialized {
+                processor
+                    .send_initialize_notifications_to_connection(connection_id)
+                    .await;
+                if let Some((sender, status)) = remote_status {
+                    sender
+                        .send_server_notification_to_connections(
+                            &[connection_id],
+                            ServerNotification::RemoteControlStatusChanged(status.clone()),
+                        )
+                        .await;
+                }
+                processor
+                    .connection_initialized(
+                        connection_id,
+                        connection_state.session.request_attestation(),
+                    )
+                    .await;
+                connection_state
+                    .outbound_initialized
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        JSONRPCMessage::Response(response) => {
+            processor.process_response(connection_id, response).await;
+        }
+        JSONRPCMessage::Notification(notification) => {
+            processor.process_notification(notification).await;
+        }
+        JSONRPCMessage::Error(err) => {
+            processor.process_error(connection_id, err).await;
+        }
+    }
+}
 #[derive(Default)]
 struct ShutdownState {
     requested: bool,
@@ -1245,81 +1320,8 @@ pub async fn run_main_with_transport_options(
                                     warn!("dropping message from unknown connection: {connection_id:?}");
                                     continue;
                                 };
-                                if connection_state.session.rpc_gate.is_closed() {
-                                    continue;
-                                }
-                                match message {
-                                    JSONRPCMessage::Request(request) => {
-                                        let was_initialized =
-                                            connection_state.session.initialized();
-                                        processor
-                                            .process_request(
-                                                connection_id,
-                                                request,
-                                                &transport,
-                                                Arc::clone(&connection_state.session),
-                                            )
-                                            .await;
-                                        let opted_out_notification_methods_snapshot = connection_state
-                                            .session
-                                            .opted_out_notification_methods();
-                                        let experimental_api_enabled =
-                                            connection_state.session.experimental_api_enabled();
-                                        let is_initialized = connection_state.session.initialized();
-                                        if let Ok(mut opted_out_notification_methods) = connection_state
-                                            .outbound_opted_out_notification_methods
-                                            .write()
-                                        {
-                                            *opted_out_notification_methods =
-                                                opted_out_notification_methods_snapshot;
-                                        } else {
-                                            warn!(
-                                                "failed to update outbound opted-out notifications"
-                                            );
-                                        }
-                                        connection_state
-                                            .outbound_experimental_api_enabled
-                                            .store(
-                                                experimental_api_enabled,
-                                                std::sync::atomic::Ordering::Release,
-                                            );
-                                        if !was_initialized && is_initialized {
-                                            processor
-                                                .send_initialize_notifications_to_connection(
-                                                    connection_id,
-                                                )
-                                                .await;
-                                            initialize_notification_sender
-                                                .send_server_notification_to_connections(
-                                                    &[connection_id],
-                                                    ServerNotification::RemoteControlStatusChanged(
-                                                        remote_control_status.clone(),
-                                                    ),
-                                                )
-                                                .await;
-                                            processor
-                                                .connection_initialized(
-                                                    connection_id,
-                                                    connection_state
-                                                        .session
-                                                        .request_attestation(),
-                                                )
-                                                .await;
-                                            connection_state
-                                                .outbound_initialized
-                                                .store(true, std::sync::atomic::Ordering::Release);
-                                        }
-                                    }
-                                    JSONRPCMessage::Response(response) => {
-                                        processor.process_response(connection_id, response).await;
-                                    }
-                                    JSONRPCMessage::Notification(notification) => {
-                                        processor.process_notification(notification).await;
-                                    }
-                                    JSONRPCMessage::Error(err) => {
-                                        processor.process_error(connection_id, err).await;
-                                    }
-                                }
+                                dispatch_network_message(&processor, &transport, connection_id,
+                                    connection_state, message, Some((&initialize_notification_sender, &remote_control_status))).await;
                             }
                         }
                     }

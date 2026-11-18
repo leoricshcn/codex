@@ -102,7 +102,7 @@ use tracing::warn;
 #[path = "in_process_bootstrap.rs"]
 mod bootstrap;
 
-const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
+pub(crate) const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(u64::MAX);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Covers both bounded runtime drains plus the analytics client's 25-second best-effort flush.
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(35);
@@ -390,7 +390,15 @@ impl InProcessClientHandle {
 /// returning the handle, so callers receive a ready-to-use runtime. Rejected
 /// initialization shuts down the runtime and returns an `InvalidData` error.
 /// Transport failures while processing `initialized` also shut down the runtime.
-pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+pub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+    start_with_socket(args, None).await
+}
+
+/// Optionally attach a private Unix listener to this same embedded processor.
+pub async fn start_with_socket(
+    mut args: InProcessStartArgs,
+    socket: Option<crate::AbsolutePathBuf>,
+) -> IoResult<InProcessClientHandle> {
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&args.config.config_layer_stack).await {
         let (path, range) = crate::exec_policy_warning_location(&err);
         args.config_warnings.push(ConfigWarningNotification {
@@ -402,7 +410,7 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
     }
     let initialize = args.initialize.clone();
     // Keep embedded startup state off callers' stacks, which are smaller on Windows.
-    let client = Box::pin(start_uninitialized(args)).await?;
+    let client = Box::pin(start_uninitialized(args, socket)).await?;
 
     let initialize_response = client
         .request(ClientRequest::Initialize {
@@ -444,12 +452,17 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
 async fn run_outbound_router(
     mut outgoing_rx: mpsc::Receiver<OutgoingEnvelope>,
     mut outbound_connections: HashMap<ConnectionId, OutboundConnectionState>,
+    mut registrations: mpsc::Receiver<(ConnectionId, Option<OutboundConnectionState>)>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown_rx => break,
+            Some((id, state)) = registrations.recv() => {
+                if let Some(state) = state { outbound_connections.insert(id, state); }
+                else { outbound_connections.remove(&id); }
+            }
             envelope = outgoing_rx.recv() => {
                 let Some(envelope) = envelope else {
                     break;
@@ -460,7 +473,10 @@ async fn run_outbound_router(
     }
 }
 
-async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+async fn start_uninitialized(
+    mut args: InProcessStartArgs,
+    socket: Option<crate::AbsolutePathBuf>,
+) -> IoResult<InProcessClientHandle> {
     let config_manager = ConfigManager::new(
         args.config.codex_home.to_path_buf(),
         args.cli_overrides,
@@ -485,7 +501,25 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
+    let (socket_tx, mut socket_rx) = mpsc::channel(channel_capacity);
+    let cancel_socket = tokio_util::sync::CancellationToken::new();
+    let socket_guard = cancel_socket.clone().drop_guard();
+    let listener = if let Some(path) = &socket {
+        Some(
+            crate::start_control_socket_acceptor(
+                path.clone(),
+                socket_tx,
+                cancel_socket.clone(),
+                crate::DaemonShutdownAccess::Disabled,
+                crate::WebSocketCompression::Plain,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let runtime_handle = tokio::spawn(async move {
+        let _socket_guard = socket_guard;
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
         let runtime_auth_slot = args
             .config
@@ -502,6 +536,7 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
         let (process_reply_tx, mut process_reply_rx) = mpsc::channel(channel_capacity);
         let outgoing_message_sender = Arc::new(
             OutgoingMessageSender::new(outgoing_tx, analytics_events_client.clone())
+                .with_embedded_socket(socket.is_some())
                 .with_process_reply_sender(process_reply_tx),
         );
 
@@ -534,9 +569,11 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
             ),
         );
         let (outbound_shutdown_tx, outbound_shutdown_rx) = oneshot::channel();
+        let (routes_tx, routes_rx) = mpsc::channel(channel_capacity);
         let mut outbound_handle = tokio::spawn(run_outbound_router(
             outgoing_rx,
             outbound_connections,
+            routes_rx,
             outbound_shutdown_rx,
         ));
 
@@ -575,9 +612,38 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                 crate::transport::ConnectionOrigin::InProcess,
             ));
             let mut listen_for_threads = true;
+            let mut connections = HashMap::<ConnectionId, crate::ConnectionState>::new();
+            let transport =
+                socket.map(|socket_path| crate::AppServerTransport::UnixSocket { socket_path });
 
             loop {
                 tokio::select! {
+                    Some(event) = socket_rx.recv() => {
+                        match event {
+                            crate::TransportEvent::ConnectionOpened { connection_id, origin, auth, writer, disconnect_sender } => {
+                                let initialized = Arc::new(AtomicBool::new(false));
+                                let experimental = Arc::new(AtomicBool::new(false));
+                                let opt_out = Arc::new(RwLock::new(HashSet::new()));
+                                let state = crate::ConnectionState::new(origin, auth, initialized.clone(), experimental.clone(), opt_out.clone());
+                                let outbound = OutboundConnectionState::new(writer, initialized, experimental, opt_out, disconnect_sender);
+                                if routes_tx.send((connection_id, Some(outbound))).await.is_err() { break; }
+                                connections.insert(connection_id, state);
+                            }
+                            crate::TransportEvent::IncomingMessage { connection_id, message } => {
+                                if let (Some(state), Some(transport)) = (connections.get(&connection_id), &transport) {
+                                    crate::dispatch_network_message(&processor, transport, connection_id, state, message, None).await;
+                                }
+                            }
+                            crate::TransportEvent::ConnectionClosed { connection_id } => {
+                                if let Some(state) = connections.remove(&connection_id) {
+                                    state.session.rpc_gate.close().await;
+                                    processor.connection_closed(connection_id, &state.session).await;
+                                    if routes_tx.send((connection_id, None)).await.is_err() { break; }
+                                }
+                            }
+                            crate::TransportEvent::DaemonShutdown => {}
+                        }
+                    }
                     command = processor_rx.recv() => {
                         match command {
                             Some(ProcessorCommand::Request(request, cancellation)) => {
@@ -629,11 +695,12 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {
                             Ok(thread_id) => {
-                                let connection_ids = if session.initialized() {
+                                let mut connection_ids = if session.initialized() {
                                     vec![IN_PROCESS_CONNECTION_ID]
                                 } else {
                                     Vec::<ConnectionId>::new()
                                 };
+                                connection_ids.extend(connections.iter().filter_map(|(id,s)| s.session.initialized().then_some(*id)));
                                 processor
                                     .try_attach_thread_listener(thread_id, connection_ids)
                                     .await;
@@ -654,6 +721,10 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
             processor
                 .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
                 .await;
+            for (id, state) in connections {
+                state.session.rpc_gate.close().await;
+                processor.connection_closed(id, &state.session).await;
+            }
             processor.clear_all_thread_listeners().await;
             processor.drain_background_tasks().await;
             processor.shutdown_threads().await;
@@ -880,6 +951,10 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
             let _ = outbound_handle.await;
         }
 
+        cancel_socket.cancel();
+        if let Some(task) = listener {
+            let _ = task.await;
+        }
         analytics_events_flush_client.flush().await;
 
         if let Some(done_tx) = shutdown_ack {
@@ -1113,6 +1188,7 @@ mod tests {
         let mut outbound_handle = tokio::spawn(run_outbound_router(
             outgoing_rx,
             HashMap::new(),
+            mpsc::channel(1).1,
             shutdown_rx,
         ));
 

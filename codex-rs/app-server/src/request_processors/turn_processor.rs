@@ -716,6 +716,11 @@ impl TurnRequestProcessor {
             )
             .await?;
 
+        // A client resuming only to observe must never claim restored tools.
+        // Keep a live creator's ownership, or bind the next submitting client.
+        self.outgoing
+            .claim_tool_owner(thread_id, request_id.connection_id)
+            .await;
         let submission = thread
             .start_or_steer_turn(
                 TurnInputRequest::new(input)

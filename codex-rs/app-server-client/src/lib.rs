@@ -382,9 +382,18 @@ impl InProcessAppServerClient {
     /// The returned client is ready for requests and ordered event consumption.
     /// Request queues remain bounded without blocking on unread notifications.
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
+        Self::start_with_socket(args, None).await
+    }
+
+    /// Starts one embedded server with an optional external Unix socket.
+    pub async fn start_with_socket(
+        args: InProcessClientStartArgs,
+        socket: Option<AbsolutePathBuf>,
+    ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let mut handle =
-            codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
+            codex_app_server::in_process::start_with_socket(args.into_runtime_start_args(), socket)
+                .await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can
@@ -743,7 +752,8 @@ impl AppServerRequestHandle {
         decode_typed_response("thread/start", response)
     }
 
-    pub(crate) async fn resolve_server_request(
+    /// Reply on the originating connection while its event consumer continues reading.
+    pub async fn resolve_server_request(
         &self,
         request_id: RequestId,
         result: JsonRpcResult,
@@ -755,7 +765,8 @@ impl AppServerRequestHandle {
         }
     }
 
-    pub(crate) async fn reject_server_request(
+    /// Reject a request on the originating connection.
+    pub async fn reject_server_request(
         &self,
         request_id: RequestId,
         error: JSONRPCErrorError,

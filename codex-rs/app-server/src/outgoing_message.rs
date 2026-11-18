@@ -141,6 +141,7 @@ pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
     process_reply_sender: mpsc::Sender<OutgoingEnvelope>,
+    tool_owners: Option<Mutex<HashMap<ThreadId, ConnectionId>>>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
@@ -158,6 +159,7 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
 
 struct PendingCallbackEntry {
     human_approval_recipients: HashSet<ConnectionId>,
+    tool_owner: Option<ConnectionId>,
     verification_owner: Option<ConnectionId>,
     verification_auth_revision: Option<u64>,
     verification_identity: Option<user_verification_auth::Identity>,
@@ -276,10 +278,28 @@ impl OutgoingMessageSender {
             human_approval_connections: Mutex::new(HashSet::new()),
             next_server_request_id: AtomicI64::new(0),
             process_reply_sender: sender.clone(),
+            tool_owners: None,
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
             request_contexts: Mutex::new(HashMap::new()),
             analytics_events_client,
+        }
+    }
+
+    pub(crate) fn with_embedded_socket(mut self, enabled: bool) -> Self {
+        self.tool_owners = enabled.then(Mutex::default);
+        self
+    }
+
+    pub(crate) async fn claim_tool_owner(&self, thread: ThreadId, connection: ConnectionId) {
+        if let Some(owners) = &self.tool_owners {
+            owners.lock().await.entry(thread).or_insert(connection);
+        }
+    }
+
+    pub(crate) async fn release_tool_owner(&self, thread: ThreadId) {
+        if let Some(owners) = &self.tool_owners {
+            owners.lock().await.remove(&thread);
         }
     }
 
@@ -333,6 +353,14 @@ impl OutgoingMessageSender {
             .remove(&connection_id);
         self.disconnect_user_verification_connection(connection_id)
             .await;
+        if let Some(owners) = &self.tool_owners {
+            let mut owners = owners.lock().await;
+            owners.retain(|_, owner| *owner != connection_id);
+            self.request_id_to_callback
+                .lock()
+                .await
+                .retain(|_, entry| entry.tool_owner != Some(connection_id));
+        }
         let mut request_contexts = self.request_contexts.lock().await;
         request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
     }
@@ -413,6 +441,27 @@ impl OutgoingMessageSender {
                     || verification_identity != self.verification_identity())
         };
         let (tx_approve, rx_approve) = oneshot::channel();
+        let tool_owners = if matches!(&request, ServerRequest::DynamicToolCall { .. }) {
+            match &self.tool_owners {
+                Some(owners) => Some(owners.lock().await),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let tool_owner = tool_owners
+            .as_ref()
+            .and_then(|owners| thread_id.and_then(|id| owners.get(&id).copied()));
+        if tool_owners.is_some()
+            && !tool_owner
+                .is_some_and(|owner| connection_ids.is_some_and(|ids| ids.contains(&owner)))
+        {
+            return (outgoing_message_id, rx_approve);
+        }
+        let connection_ids = tool_owner
+            .as_ref()
+            .map(std::slice::from_ref)
+            .or(connection_ids);
         let human_connections;
         let connection_ids = if requires_human_approval(&request) {
             let eligible = self.human_approval_connections.lock().await;
@@ -456,6 +505,7 @@ impl OutgoingMessageSender {
                     } else {
                         HashSet::new()
                     },
+                    tool_owner,
                     verification_owner,
                     verification_auth_revision,
                     verification_identity: verification_identity.clone(),
@@ -466,6 +516,7 @@ impl OutgoingMessageSender {
                 },
             );
         }
+        drop(tool_owners);
         // Disconnect may finish its callback cleanup before registration acquires the lock.
         // Recheck afterward so that ordering cannot leave an orphaned verification callback.
         if let Some(owner) = verification_owner {
@@ -666,6 +717,9 @@ impl OutgoingMessageSender {
             .contains(&connection_id);
         let mut callbacks = self.request_id_to_callback.lock().await;
         let entry = callbacks.get(id)?;
+        if entry.tool_owner.is_some_and(|owner| owner != connection_id) {
+            return None;
+        }
         if requires_human_approval(&entry.request)
             && (!human_approval || !entry.human_approval_recipients.contains(&connection_id))
         {
@@ -693,8 +747,10 @@ impl OutgoingMessageSender {
         let mut requests = request_id_to_callback
             .values()
             .filter_map(|entry| {
-                (entry.thread_id == Some(thread_id) && entry.verification_owner.is_none())
-                    .then_some(entry.request.clone())
+                (entry.thread_id == Some(thread_id)
+                    && entry.verification_owner.is_none()
+                    && entry.tool_owner.is_none())
+                .then_some(entry.request.clone())
             })
             .collect::<Vec<_>>();
         requests.sort_by(|left, right| left.id().cmp(right.id()));
@@ -979,9 +1035,10 @@ impl OutgoingMessageSender {
         message_kind: &'static str,
     ) {
         // Process requests serialize by handle. A blocked resize reply would also block the next kill.
-        let sender = if request_context
-            .as_ref()
-            .is_some_and(|ctx| ctx.is_process_request)
+        let sender = if connection_id == crate::in_process::IN_PROCESS_CONNECTION_ID
+            && request_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.is_process_request)
         {
             &self.process_reply_sender
         } else {

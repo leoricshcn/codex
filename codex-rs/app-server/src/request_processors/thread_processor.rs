@@ -1134,6 +1134,7 @@ impl ThreadRequestProcessor {
     }
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
+        self.outgoing.release_tool_owner(thread_id).await;
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
@@ -1767,6 +1768,12 @@ impl ThreadRequestProcessor {
             reasoning_effort: config_snapshot.reasoning_effort,
             multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         };
+        if dynamic_tool_count > 0 {
+            listener_task_context
+                .outgoing
+                .claim_tool_owner(thread_id, request_id.connection_id)
+                .await;
+        }
         let notif = thread_started_notification(thread);
         listener_task_context
             .outgoing
