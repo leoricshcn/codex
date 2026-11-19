@@ -93,6 +93,7 @@ use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 pub use codex_rollout::StateDbHandle;
 pub use codex_state::log_db::LogDbLayer;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -397,7 +398,7 @@ pub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> 
 /// Optionally attach a private Unix listener to this same embedded processor.
 pub async fn start_with_socket(
     mut args: InProcessStartArgs,
-    socket: Option<crate::AbsolutePathBuf>,
+    socket: Option<AbsolutePathBuf>,
 ) -> IoResult<InProcessClientHandle> {
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&args.config.config_layer_stack).await {
         let (path, range) = crate::exec_policy_warning_location(&err);
@@ -475,7 +476,7 @@ async fn run_outbound_router(
 
 async fn start_uninitialized(
     mut args: InProcessStartArgs,
-    socket: Option<crate::AbsolutePathBuf>,
+    socket: Option<AbsolutePathBuf>,
 ) -> IoResult<InProcessClientHandle> {
     let config_manager = ConfigManager::new(
         args.config.codex_home.to_path_buf(),
